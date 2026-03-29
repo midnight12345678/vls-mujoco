@@ -1,6 +1,32 @@
-# VLS: Vision Language Steering for Robot Manipulation
+# VLS: Steering Pretrained Robot Policies via Vision–Language Models
 
-VLS - a diffusion-based robot manipulation policy with Feynman-Kac resample and VLM-based task planning.
+<p align="center">
+  <a href="https://arxiv.org/abs/2602.03973"><img src="https://img.shields.io/badge/arXiv-2602.03973-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://vision-language-steering.github.io/webpage/"><img src="https://img.shields.io/badge/Project-Page-blue" alt="Project Page"></a>
+</p>
+
+<p align="center">
+  <strong>Shuo Liu</strong><sup>1,2</sup> &nbsp;
+  <strong>Ishneet Sukhvinder Singh</strong><sup>3</sup> &nbsp;
+  <strong>Yiqing Xu</strong><sup>2,4</sup> &nbsp;
+  <strong>Jiafei Duan</strong><sup>1,2*</sup> &nbsp;
+  <strong>Ranjay Krishna</strong><sup>1,2*</sup>
+</p>
+
+<p align="center">
+  <sup>1</sup>University of Washington &nbsp;
+  <sup>2</sup>Allen Institute for AI &nbsp;
+  <sup>3</sup>University of Oxford &nbsp;
+  <sup>4</sup>National University of Singapore
+</p>
+
+<p align="center"><sup>*</sup>Co-advised</p>
+
+## Abstract
+
+Pretrained diffusion and flow-matching policies often fail under train-test distribution shifts. Rather than retraining, **VLS** performs **inference-time adaptation** by leveraging vision-language models to synthesize differentiable reward functions that steer the sampling process of pretrained policies toward satisfying test-time spatial and task requirements.
+
+VLS introduces three steering mechanisms: **gradient-based refinement**, **RBF diversity**, and **Feynman–Kac resampling** — achieving **+31%** on CALVIN and **+13%** on LIBERO-PRO, with real-world Franka robot deployment.
 
 ## Installation
 
@@ -22,7 +48,6 @@ git submodule update --init --recursive
 #### Option A: Use Conda Environment (Recommended)
 
 ```bash
-# Create environment from exported yml
 conda env create -f environment.yml
 conda activate vls
 ```
@@ -30,7 +55,6 @@ conda activate vls
 #### Option B: Use pip
 
 ```bash
-# Install from requirements.txt (exported from vls conda env)
 pip install -r requirements.txt
 ```
 
@@ -62,16 +86,12 @@ cd ../..
 
 ### 3. Download Model Checkpoints
 
-**Diffusion Policy Checkpoint:**
-
 Download or train your diffusion policy checkpoint and update the path in `config.yaml`:
 
 ```yaml
 policy:
   pretrained_path: "/path/to/your/checkpoint/"
 ```
-
-We provide a pretrained base [Diffusion Policy checkpoint](https://huggingface.co/Vision-Language-Steering/vls_calvin_base) for CALVIN.
 
 ## Configuration
 
@@ -89,7 +109,7 @@ main:
   sample_batch_size: 20             # Number of particles for FK steering
   action_horizon: 14                # Action sequence length
   start_step: 70                    # When to start guidance (diffusion step)
-  MCMC_steps: 4                     # MCMC steps foe each denoising step
+  MCMC_steps: 4                     # MCMC steps for each denoising step
 ```
 
 ### Environment Backend
@@ -117,7 +137,6 @@ backend:
     suite_name: "libero_spatial"  # Options: libero_spatial, libero_object, libero_goal, libero_10
     vlm_camera: "agentview"
 ```
-
 
 ### VLM Agent
 
@@ -149,8 +168,6 @@ python main.py --config config.yaml
 
 ### Pipeline Overview
 
-The execution follows this pipeline:
-
 ```
 1. Environment Setup
    └─> Load environment adapter (CALVIN/LIBERO/RealWorld)
@@ -173,7 +190,7 @@ The execution follows this pipeline:
       - Sample multiple action sequences (particles)
       - Transform delta_ee to 3D trajectories
       - Compute reward based on reward functions
-      - (will) FK resampling: weight and resample particles
+      - FK resampling: weight and resample particles
       - Guided MCMC sampling
    d) Select best action from guided samples
    e) Execute action in environment
@@ -214,7 +231,7 @@ The execution follows this pipeline:
 
 ## Important Notes
 
-### 1. API Keys for VLM
+### API Keys for VLM
 
 Set your API key as environment variable:
 
@@ -224,15 +241,13 @@ export OPENAI_API_KEY="your-key-here"
 export ANTHROPIC_API_KEY="your-key-here"
 ```
 
-Or set in code before running.
-
-### 2. Checkpoint Compatibility
+### Checkpoint Compatibility
 
 Make sure your policy checkpoint matches the observation space and action space:
 - CALVIN: RGB (200x200) + Proprioception
 - Action: 7-DOF delta pose + gripper
 
-### 3. Guidance Parameters Tuning
+### Guidance Parameters Tuning
 
 - `guide_scale`: Higher = stronger guidance, but may reduce diversity
 - `diversity_scale`: Controls particle diversity during resampling
@@ -246,7 +261,7 @@ Typical ranges:
 - `sample_batch_size`: 10-50
 - `start_step`: 50-80
 
-### 4. Output Directory Structure
+### Output Directory Structure
 
 ```
 results/
@@ -265,7 +280,7 @@ results/
     └── behavior_static.png             # Heatmap of end-effector positions
 ```
 
-### 5. Debugging
+### Debugging
 
 Enable visualizations for debugging:
 
@@ -307,3 +322,15 @@ tail -f results/TIMESTAMP/run.log
 - Set `visualize_trajectory: false`
 - Use smaller image sizes in env config
 
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@article{liu2026vls,
+  title     = {VLS: Steering Pretrained Robot Policies via Vision-Language Models},
+  author    = {Shuo Liu and Ishneet Sukhvinder Singh and Yiqing Xu and Jiafei Duan and Ranjay Krishna},
+  journal   = {arXiv preprint arXiv:2602.03973},
+  year      = {2026}
+}
+```
