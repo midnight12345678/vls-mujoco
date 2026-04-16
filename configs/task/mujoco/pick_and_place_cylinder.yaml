@@ -1,0 +1,17 @@
+# Task: Pick and Place Cylinder (Manipulator MuJoCo)
+# @package _global_
+
+task:
+  name: pick_and_place_cylinder
+  backend: mujoco
+
+main:
+  instruction: "pick the yellow cylinder and place it in the red drop zone"
+
+backend:
+  mujoco:
+    task_name: pick_and_place_cylinder
+    instruction: "pick the yellow cylinder and place it in the red drop zone"
+    target_object: Cylinder
+    target_zone: zone_drop
+    success_distance: 0.08

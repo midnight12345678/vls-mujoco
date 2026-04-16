@@ -116,7 +116,7 @@ main:
 
 ```yaml
 backend:
-  backend: "calvin"  # Options: "calvin", "libero", "realworld"
+  backend: "calvin"  # Options: "calvin", "libero", "mujoco", "realworld"
 ```
 
 **CALVIN-specific:**
@@ -136,6 +136,17 @@ backend:
   libero:
     suite_name: "libero_spatial"  # Options: libero_spatial, libero_object, libero_goal, libero_10
     vlm_camera: "agentview"
+```
+
+**Manipulator MuJoCo-specific:**
+```yaml
+backend:
+  backend: "mujoco"
+  mujoco:
+    scene_path: "manipulator_grasp/assets/scenes/scene.xml"
+    camera_name: "cam"
+    target_object: "Cylinder"
+    target_zone: "zone_drop"
 ```
 
 ### VLM Agent
@@ -170,7 +181,7 @@ python main.py --config config.yaml
 
 ```
 1. Environment Setup
-   └─> Load environment adapter (CALVIN/LIBERO/RealWorld)
+   └─> Load environment adapter (CALVIN/LIBERO/MuJoCo/RealWorld)
    └─> Initialize observation space
 
 2. VLM Query Stage

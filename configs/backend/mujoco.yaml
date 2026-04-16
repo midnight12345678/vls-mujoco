@@ -1,0 +1,31 @@
+# Manipulator MuJoCo Environment Configuration
+# @package backend
+
+backend: mujoco
+
+mujoco:
+  scene_path: manipulator_grasp/assets/scenes/scene.xml
+  camera_name: cam
+  vlm_camera: cam
+
+  sim_hz: 500
+  control_hz: 50
+  render: ${main.render}
+  max_episode_steps: 300
+
+  observation_width: 256
+  observation_height: 256
+  visualization_width: 640
+  visualization_height: 640
+
+  task_name: pick_and_place_cylinder
+  instruction: "pick the yellow cylinder and place it in the red drop zone"
+  target_object: Cylinder
+  target_zone: zone_drop
+  success_distance: 0.08
+  recommended_guide_scale: 80.0
+
+  interactable_objects:
+    - Cylinder
+    - Box
+    - T_block

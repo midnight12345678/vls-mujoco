@@ -472,6 +472,10 @@ class BaseEnvAdapter(gym.Env):
     def get_instruction(self) -> str:
         """Get the current task instruction."""
         return self._env_config.get('instruction', '')
+
+    def get_task_description(self) -> str:
+        """Get task description used by VLM stage recognizer."""
+        return self.get_instruction()
     
     # ==================== Environment Interface ====================
     
@@ -563,5 +567,4 @@ class BaseEnvAdapter(gym.Env):
     def to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
         """Convert torch tensor to numpy array."""
         return tensor.detach().cpu().numpy()
-
 

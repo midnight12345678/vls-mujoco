@@ -804,6 +804,9 @@ def main(cfg: DictConfig) -> None:
         log.info(f"Target behavior: {target_behavior or 'any'}")
     elif env_backend == "libero":
         log.info(f"Suite: {cfg.backend.libero.suite_name}")
+    elif env_backend == "mujoco":
+        log.info(f"Task: {cfg.backend.mujoco.get('task_name', 'unknown')}")
+        log.info(f"Target object: {cfg.backend.mujoco.get('target_object', 'unknown')}")
     
     # Initialize and run
     runner = Main(cfg)
