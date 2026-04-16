@@ -1,6 +1,10 @@
+<<<<<<< HEAD
 ### Python template
 # Byte-compiled / optimized / DLL files
 .idea/
+=======
+# Byte-compiled / optimized / DLL files
+>>>>>>> remotes/origin/main
 __pycache__/
 *.py[cod]
 *$py.class
@@ -14,7 +18,11 @@ build/
 develop-eggs/
 dist/
 downloads/
+<<<<<<< HEAD
 eggs/
+=======
+egss/
+>>>>>>> remotes/origin/main
 .eggs/
 lib/
 lib64/
@@ -28,11 +36,21 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+<<<<<<< HEAD
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+=======
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+pip-wheel-metadata/
+>>>>>>> remotes/origin/main
 
 # Installer logs
 pip-log.txt
@@ -45,11 +63,17 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+<<<<<<< HEAD
+=======
+pytest_cache/
+.pytest_cache/
+>>>>>>> remotes/origin/main
 nosetests.xml
 coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+<<<<<<< HEAD
 .pytest_cache/
 cover/
 
@@ -138,3 +162,51 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 /logs
+=======
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / IDE
+.idea/
+.vscode/
+*.code-workspace
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# ML / training artifacts
+wandb/
+lightning_logs/
+runs/
+checkpoints/
+outputs/
+tensorboard/
+tb_logs/
+experiments/
+artifacts/
+
+# Caches (DL/ML tools)
+.huggingface/
+transformers_cache/
+torch_cache/
+torch_extensions/
+.cache/
+cache/
+
+# Environment files
+.env
+.env.*
+
+# Results
+results/
+
+# Output directory
+output/
+>>>>>>> remotes/origin/main

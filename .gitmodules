@@ -1,3 +1,18 @@
+<<<<<<< HEAD
 [submodule "graspnet-baseline"]
 	path = graspnet-baseline
 	url = git@github.com:graspnet/graspnet-baseline.git
+=======
+[submodule "third_party/lerobot"]
+	path = third_party/lerobot
+	url = https://github.com/Treeeplanter/lerobot.git
+[submodule "third_party/calvin"]
+	path = third_party/calvin
+	url = https://github.com/Treeeplanter/calvin.git
+[submodule "sam3"]
+	path = sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "third_party/libero_pro"]
+	path = third_party/libero_pro
+	url = git@github.com:Treeeplanter/LIBERO-PRO.git
+>>>>>>> remotes/origin/main
