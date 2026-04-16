@@ -2,7 +2,7 @@
 VLS utilities for multi-backend support.
 
 This package provides:
-- env_adapters: Unified interface for CALVIN, LIBERO, and real-world robots
+- env_adapters: Unified interface for CALVIN, LIBERO, MuJoCo, and real-world robots
 - keypoint_tracker: Keypoint tracking using adapters
 - sam_segmenter: Independent SAM segmentation component
 """
@@ -14,6 +14,7 @@ from .env_adapters import (
     TrackedObject,
     CalvinAdapter,
     LiberoAdapter,
+    ManipulatorMujocoAdapter,
     create_adapter,
 )
 from .keypoint_tracker import KeypointTracker
@@ -38,6 +39,7 @@ __all__ = [
     "TrackedObject",
     "CalvinAdapter",
     "LiberoAdapter",
+    "ManipulatorMujocoAdapter",
     "create_adapter",
     # Keypoint tracking
     "KeypointTracker",
@@ -45,4 +47,3 @@ __all__ = [
     "get_sam_segmenter",
     "get_vlm_sam_pipeline",
 ]
-
