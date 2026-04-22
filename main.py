@@ -12,8 +12,14 @@ Usage:
 """
 
 import os
+import shutil
 # Set tokenizers parallelism to false to avoid fork warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Default to EGL for headless Linux rendering to avoid corrupted offscreen frames.
+if os.name != "nt" and "MUJOCO_GL" not in os.environ:
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["MUJOCO_GL"] = "egl"
 
 from typing import Any, Callable, List, Optional
 import gymnasium as gym
@@ -32,6 +38,7 @@ import tqdm
 import time
 import sys
 import json
+import re
 import warnings
 
 # Hydra imports
@@ -67,6 +74,7 @@ from core.diffusion_policy_steer import DiffusionPolicySteer
 from core.pi05_steer import PI05PolicySteer
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.envs.factory import make_env_pre_post_processors
 
@@ -100,6 +108,11 @@ class Main:
         # Get backend from config
         self.backend = cfg.backend.get('backend', 'calvin')
         log.info(f"Using backend: {self.backend}")
+
+        self.sample_batch_size = int(self.config.get('sample_batch_size', 1))
+        if self.backend == 'mujoco' and self.config.get('use_guidance', False) and self.sample_batch_size <= 1:
+            self.sample_batch_size = 8
+            log.info("MuJoCo guidance is enabled with sample_batch_size=1; using effective sample_batch_size=8 to activate diversity/FKD steering.")
         
         # Get backend-specific config
         env_config = OmegaConf.to_container(cfg.backend.get(self.backend, {}), resolve=True)
@@ -131,6 +144,7 @@ class Main:
         policy_config = cfg.get('policy', {})
         policy_type = policy_config.get('type', 'diffusion')
         log.info(f"Policy config type: {policy_type}")
+        self.device = str(cfg.get('device', 'cuda'))
         
         # Get pretrained_path from the specific policy type config
         type_config = policy_config.get(policy_type, {})
@@ -140,15 +154,20 @@ class Main:
         if policy_type == 'diffusion':
             self.policy = DiffusionPolicySteer.from_pretrained(pretrained_path)
         elif policy_type == 'pi05':
-            self.policy = PI05PolicySteer.from_pretrained(pretrained_path)
+            pi05_config = PreTrainedConfig.from_pretrained(pretrained_path)
+            pi05_config.device = self.device
+            self.policy = PI05PolicySteer.from_pretrained(
+                pretrained_path,
+                config=pi05_config,
+                strict=False,
+            )
         else:
             raise ValueError(f"Unknown policy type: {policy_type}")
         
-        self.device = cfg.get('device', 'cuda')
         self.policy.to(self.device)
 
         preprocessor_overrides = {
-            "device_processor": {"device": str(self.policy.config.device)},
+            "device_processor": {"device": self.device},
         }
 
         self.policy_preprocessor, self.policy_postprocessor = make_pre_post_processors(
@@ -160,7 +179,7 @@ class Main:
         self.policy.post_init(
             adapter=self.adapter,
             postprocessor=self.policy_postprocessor,
-            sample_batch_size=self.config.get('sample_batch_size', 1),
+            sample_batch_size=self.sample_batch_size,
             policy_config=policy_config[policy_type],
         )
 
@@ -185,64 +204,79 @@ class Main:
         """Initialize components."""
         # Get perception config (loaded from perception.yaml with @package perception)
         perception_cfg = cfg.get('perception', {})
+        guidance_enabled = bool(self.config.get("use_guidance", True))
 
-        # Initialize keypoint detector
-        kp_config = OmegaConf.to_container(perception_cfg.get('keypoint_detector', {}), resolve=True)
-        self.keypoint_detector = KeypointDetector(config=kp_config)
+        if guidance_enabled:
+            # Initialize keypoint detector
+            kp_config = OmegaConf.to_container(perception_cfg.get('keypoint_detector', {}), resolve=True)
+            self.keypoint_detector = KeypointDetector(config=kp_config)
 
-        # Initialize SAM3 segmenter if enabled
-        sam3_config = perception_cfg.get('sam3', {})
-        self.use_sam3 = sam3_config.get('enabled', False) if sam3_config else False
-        if self.use_sam3:
-            log.info("Initializing SAM3 segmenter for text-prompted segmentation")
-            sam3_dict = OmegaConf.to_container(sam3_config, resolve=True)
-            self.sam3_segmenter = create_sam3_segmenter(sam3_dict)
-            self.sam3_default_objects = sam3_config.get('default_objects', [])
-        else:
-            self.sam3_segmenter = None
-
-        # Initialize Gemini grounder if enabled
-        gemini_config = perception_cfg.get('gemini_grounding', {})
-        self.use_gemini = gemini_config.get('enabled', False) if gemini_config else False
-        if self.use_gemini:
-            api_key = gemini_config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
-            if api_key:
-                gemini_dict = OmegaConf.to_container(gemini_config, resolve=True)
-                gemini_dict['api_key'] = api_key
-                log.info("Initializing Gemini grounder for visual grounding")
-                self.gemini_grounder = create_gemini_grounder(gemini_dict)
-                self.gemini_default_objects = list(gemini_config.get('default_objects', []))
+            # Initialize SAM3 segmenter if enabled
+            sam3_config = perception_cfg.get('sam3', {})
+            self.use_sam3 = sam3_config.get('enabled', False) if sam3_config else False
+            if self.use_sam3:
+                log.info("Initializing SAM3 segmenter for text-prompted segmentation")
+                sam3_dict = OmegaConf.to_container(sam3_config, resolve=True)
+                self.sam3_segmenter = create_sam3_segmenter(sam3_dict)
+                self.sam3_default_objects = sam3_config.get('default_objects', [])
             else:
-                log.warning("Gemini API key not found - disabling Gemini grounding")
-                self.use_gemini = False
+                self.sam3_segmenter = None
+
+            # Initialize Gemini grounder if enabled
+            gemini_config = perception_cfg.get('gemini_grounding', {})
+            self.use_gemini = gemini_config.get('enabled', False) if gemini_config else False
+            if self.use_gemini:
+                api_key = gemini_config.get('api_key') or os.environ.get('GOOGLE_API_KEY')
+                if api_key:
+                    gemini_dict = OmegaConf.to_container(gemini_config, resolve=True)
+                    gemini_dict['api_key'] = api_key
+                    log.info("Initializing Gemini grounder for visual grounding")
+                    self.gemini_grounder = create_gemini_grounder(gemini_dict)
+                    self.gemini_default_objects = list(gemini_config.get('default_objects', []))
+                else:
+                    log.warning("Gemini API key not found - disabling Gemini grounding")
+                    self.use_gemini = False
+                    self.gemini_grounder = None
+            else:
                 self.gemini_grounder = None
         else:
+            self.keypoint_detector = None
+            self.use_sam3 = False
+            self.sam3_segmenter = None
+            self.sam3_default_objects = []
+            self.use_gemini = False
             self.gemini_grounder = None
+            self.gemini_default_objects = []
+            log.info("Guidance disabled: skipping perception/VLM guidance components.")
 
         # Initialize keypoint tracker
         self.keypoint_tracker = KeypointTracker(self.adapter)
 
-        # Initialize VLM agent (OpenAI - for generating guidance functions)
-        vlm_config = OmegaConf.to_container(perception_cfg.get('vlm_agent', {}), resolve=True)
-        # Ensure query_template_dir is absolute path
-        if vlm_config.get('query_template_dir') and not os.path.isabs(vlm_config['query_template_dir']):
-            vlm_config['query_template_dir'] = os.path.join(PROJECT_ROOT, vlm_config['query_template_dir'])
-        self.vlm_agent = VLMAgent(
-            config=vlm_config,
-            base_dir=self.output_dir,
-            env_type=self.backend,
-        )
-        
-        # Initialize Gemini stage recognizer (for real-time stage recognition)
-        gemini_config = OmegaConf.to_container(perception_cfg.get('gemini', {}), resolve=True)
-        if self.config.get("use_vlm_stage_recognition", True):
-            try:
-                self.gemini_stage_recognizer = create_gemini_stage_recognizer(gemini_config)
-                log.info("Gemini stage recognizer initialized")
-            except Exception as e:
-                log.warning(f"Failed to initialize Gemini stage recognizer: {e}")
+        if guidance_enabled:
+            # Initialize VLM agent (OpenAI - for generating guidance functions)
+            vlm_config = OmegaConf.to_container(perception_cfg.get('vlm_agent', {}), resolve=True)
+            # Ensure query_template_dir is absolute path
+            if vlm_config.get('query_template_dir') and not os.path.isabs(vlm_config['query_template_dir']):
+                vlm_config['query_template_dir'] = os.path.join(PROJECT_ROOT, vlm_config['query_template_dir'])
+            self.vlm_agent = VLMAgent(
+                config=vlm_config,
+                base_dir=self.output_dir,
+                env_type=self.backend,
+            )
+
+            # Initialize Gemini stage recognizer (for real-time stage recognition)
+            gemini_config = OmegaConf.to_container(perception_cfg.get('gemini', {}), resolve=True)
+            if self.config.get("use_vlm_stage_recognition", True):
+                try:
+                    self.gemini_stage_recognizer = create_gemini_stage_recognizer(gemini_config)
+                    log.info("Gemini stage recognizer initialized")
+                except Exception as e:
+                    log.warning(f"Failed to initialize Gemini stage recognizer: {e}")
+                    self.gemini_stage_recognizer = None
+            else:
                 self.gemini_stage_recognizer = None
         else:
+            self.vlm_agent = None
             self.gemini_stage_recognizer = None
 
         # Initialize video recorder
@@ -252,11 +286,429 @@ class Main:
 
     def _get_policy_observation(self) -> dict:
         """Get observation in policy expected format (backend-agnostic)."""
-        sample_num = self.config.get('sample_batch_size', 20)
+        sample_num = self.sample_batch_size
         observation = self.adapter.get_policy_observation(sample_num=sample_num)
         
         processed_observation = self.policy_preprocessor(observation)
         return processed_observation
+
+    def _build_mujoco_fallback_keypoints(self) -> tuple[np.ndarray, np.ndarray, dict[int, str]]:
+        """Build minimal keypoints for MuJoCo steering when perception returns no keypoints."""
+        target_object = getattr(self.adapter, "target_object", "Cylinder")
+        target_zone = getattr(self.adapter, "target_zone", "zone_drop")
+
+        interactables = self.adapter.get_interactable_objects()
+        obj_seg = 1
+        for obj in interactables:
+            if obj.name == target_object:
+                obj_seg = obj.segment_index
+                break
+
+        keypoints: list[np.ndarray] = []
+        mask_ids: list[int] = []
+        segment_id_to_name: dict[int, str] = {obj_seg: target_object, 0: target_zone}
+
+        obj_pose = self.adapter.get_object_pose(target_object)
+        if obj_pose is not None:
+            keypoints.append(np.asarray(obj_pose.position, dtype=np.float32))
+            mask_ids.append(obj_seg)
+
+        zone_pose = self.adapter.get_object_pose(target_zone)
+        if zone_pose is not None:
+            keypoints.append(np.asarray(zone_pose.position, dtype=np.float32))
+            # Use segment 0 to keep it static in keypoint tracker.
+            mask_ids.append(0)
+
+        ee_pose = self.adapter.get_ee_pose_world()
+        keypoints.append(np.asarray(ee_pose.position, dtype=np.float32))
+        mask_ids.append(0)
+
+        return (
+            np.asarray(keypoints, dtype=np.float32),
+            np.asarray(mask_ids, dtype=np.int32),
+            segment_id_to_name,
+        )
+
+    def _augment_mujoco_keypoints_with_zone(
+        self,
+        key_points: np.ndarray,
+        mask_ids: np.ndarray,
+        segment_id_to_name: dict[int, str],
+    ) -> tuple[np.ndarray, np.ndarray, dict[int, str]]:
+        """Ensure MuJoCo keypoints include an explicit target-zone keypoint for placement stage guidance."""
+        if self.backend != "mujoco":
+            return key_points, mask_ids, segment_id_to_name
+
+        target_zone = getattr(self.adapter, "target_zone", "zone_drop")
+        zone_pose = self.adapter.get_object_pose(target_zone)
+        if zone_pose is None:
+            return key_points, mask_ids, segment_id_to_name
+
+        key_points = np.asarray(key_points, dtype=np.float32).reshape(-1, 3)
+        mask_ids = np.asarray(mask_ids, dtype=np.int32).reshape(-1)
+        segment_id_to_name = dict(segment_id_to_name or {})
+
+        # Reserve segment 0 for static reference points in tracker; map it to target zone for MuJoCo.
+        segment_id_to_name[0] = target_zone
+
+        # Avoid duplicate static-zone keypoints.
+        if np.any(mask_ids == 0):
+            return key_points, mask_ids, segment_id_to_name
+
+        zone_point = np.asarray(zone_pose.position, dtype=np.float32).reshape(1, 3)
+        key_points = np.concatenate([key_points, zone_point], axis=0)
+        mask_ids = np.concatenate([mask_ids, np.array([0], dtype=np.int32)], axis=0)
+        log.debug("Added explicit MuJoCo zone keypoint for target placement guidance.")
+        return key_points, mask_ids, segment_id_to_name
+
+    def _build_keypoint_object_map(
+        self,
+        mask_ids: np.ndarray,
+        segment_id_to_name: dict[int, str],
+    ) -> dict[int, str]:
+        mask_ids = np.asarray(mask_ids, dtype=np.int32).reshape(-1)
+        return {
+            idx: segment_id_to_name.get(int(mask_id), f"unknown_{int(mask_id)}")
+            for idx, mask_id in enumerate(mask_ids)
+        }
+
+    def _estimate_mujoco_object_anchor(self, object_name: str, object_center: np.ndarray) -> np.ndarray:
+        name = str(object_name).lower()
+        if name == "box":
+            # Box half-height in scene.xml is 0.025m; use top-center as grasp anchor.
+            return object_center + np.array([0.0, 0.0, 0.025], dtype=np.float32)
+        if name == "cylinder":
+            # Cylinder half-height in scene.xml is 0.1m; pull toward top-center.
+            return object_center + np.array([0.0, 0.0, 0.1], dtype=np.float32)
+        return object_center
+
+    def _log_mujoco_keypoint_mapping_errors(
+        self,
+        key_points: np.ndarray,
+        key_points_objects_map: dict[int, str],
+        tag: str,
+    ):
+        if self.backend != "mujoco":
+            return
+
+        key_points = np.asarray(key_points, dtype=np.float32).reshape(-1, 3)
+        log.info(f"[MuJoCoKeypointCheck/{tag}] mapping residuals (keypoint -> object center)")
+        for idx in sorted(key_points_objects_map.keys()):
+            if idx < 0 or idx >= len(key_points):
+                continue
+            object_name = key_points_objects_map[idx]
+            pose = self.adapter.get_object_pose(object_name)
+            if pose is None:
+                continue
+            delta = key_points[idx] - np.asarray(pose.position, dtype=np.float32)
+            err = float(np.linalg.norm(delta))
+            log.info(
+                f"  kp[{idx}] {object_name}: err={err:.4f}m "
+                f"(dx={delta[0]:+.4f}, dy={delta[1]:+.4f}, dz={delta[2]:+.4f})"
+            )
+
+    def _refine_mujoco_target_keypoint(
+        self,
+        key_points: np.ndarray,
+        key_points_objects_map: dict[int, str],
+    ) -> np.ndarray:
+        if self.backend != "mujoco":
+            return key_points
+
+        target_object = getattr(self.adapter, "target_object", None)
+        if target_object is None:
+            return key_points
+
+        target_idx = next(
+            (idx for idx, name in key_points_objects_map.items() if str(name) == str(target_object)),
+            None,
+        )
+        if target_idx is None:
+            return key_points
+
+        key_points = np.asarray(key_points, dtype=np.float32).reshape(-1, 3)
+        if target_idx < 0 or target_idx >= len(key_points):
+            return key_points
+
+        target_pose = self.adapter.get_object_pose(target_object)
+        if target_pose is None:
+            return key_points
+
+        object_center = np.asarray(target_pose.position, dtype=np.float32)
+        target_anchor = self._estimate_mujoco_object_anchor(target_object, object_center)
+        raw_err = float(np.linalg.norm(key_points[target_idx] - target_anchor))
+
+        snap_threshold = float(self.cfg.backend.get("mujoco", {}).get("target_keypoint_snap_threshold", 0.03))
+        if raw_err > snap_threshold:
+            log.warning(
+                f"[MuJoCoKeypointCheck] Target keypoint drift too large for {target_object} "
+                f"(err={raw_err:.4f}m > {snap_threshold:.4f}m). "
+                "Snapping to physics anchor."
+            )
+            key_points[target_idx] = target_anchor
+        return key_points
+
+    def _refine_live_mujoco_guidance_keypoints(
+        self,
+        key_points: np.ndarray,
+        key_points_objects_map: dict[int, str],
+    ) -> np.ndarray:
+        """
+        Keep MuJoCo guidance keypoints locked to physics anchors during rollout.
+
+        The detector-based keypoint registration is useful for VLM indexing, but guidance
+        should always use stable physics anchors for target/zone to avoid drift-induced
+        steering jitter.
+        """
+        if self.backend != "mujoco":
+            return key_points
+
+        key_points = np.asarray(key_points, dtype=np.float32).reshape(-1, 3).copy()
+        if key_points.shape[0] == 0:
+            return key_points
+
+        target_object = str(getattr(self.adapter, "target_object", ""))
+        target_zone = str(getattr(self.adapter, "target_zone", ""))
+
+        for idx, name in key_points_objects_map.items():
+            if idx < 0 or idx >= key_points.shape[0]:
+                continue
+
+            obj_name = str(name)
+            if obj_name == target_zone:
+                zone_pose = self.adapter.get_object_pose(target_zone)
+                if zone_pose is not None:
+                    key_points[idx] = np.asarray(zone_pose.position, dtype=np.float32)
+                continue
+
+            if obj_name == target_object:
+                target_pose = self.adapter.get_object_pose(target_object)
+                if target_pose is None:
+                    continue
+                object_center = np.asarray(target_pose.position, dtype=np.float32)
+                key_points[idx] = self._estimate_mujoco_object_anchor(target_object, object_center)
+
+        return key_points
+
+    def _project_world_keypoints_to_pixels(
+        self,
+        key_points: np.ndarray,
+        camera_name: Optional[str] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        key_points = np.asarray(key_points, dtype=np.float32).reshape(-1, 3)
+        cam_name = camera_name or getattr(self.adapter, "vlm_camera", None)
+        if cam_name is None:
+            raise ValueError("No camera name available for keypoint projection")
+
+        cam = self.adapter.get_camera_params(cam_name)
+        intrinsic = np.asarray(cam.intrinsic, dtype=np.float32)
+        world2cam = np.asarray(cam.extrinsic, dtype=np.float32)
+
+        points_h = np.concatenate(
+            [key_points, np.ones((key_points.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        points_cam = (points_h @ world2cam.T)[:, :3]
+
+        z = points_cam[:, 2]
+        valid_depth = np.isfinite(z) & (z > 1e-6)
+
+        u = intrinsic[0, 0] * (points_cam[:, 0] / np.maximum(z, 1e-6)) + intrinsic[0, 2]
+        v = intrinsic[1, 1] * (points_cam[:, 1] / np.maximum(z, 1e-6)) + intrinsic[1, 2]
+
+        pixels = np.stack([v, u], axis=1)
+        in_bounds = (
+            (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < float(cam.height))
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < float(cam.width))
+        )
+        valid = valid_depth & in_bounds
+        return pixels, valid
+
+    def _refresh_projected_keypoints_image(
+        self,
+        rgb: np.ndarray,
+        key_points: np.ndarray,
+        mask_ids: np.ndarray,
+        fallback_projected: np.ndarray,
+        key_points_objects_map: Optional[dict[int, str]] = None,
+    ) -> np.ndarray:
+        if self.backend != "mujoco":
+            return fallback_projected
+
+        try:
+            pixels, valid = self._project_world_keypoints_to_pixels(key_points)
+        except Exception as e:
+            log.warning(f"Failed to project refined MuJoCo keypoints ({e}); keeping detector overlay.")
+            return fallback_projected
+
+        projected = np.ascontiguousarray(rgb.copy(), dtype=np.uint8)
+
+        def _draw_index_box(img: np.ndarray, row: int, col: int, index: int):
+            text = str(index)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 2
+            (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            box_w = text_w + 8
+            box_h = text_h + baseline + 6
+            x1 = max(0, col - box_w // 2)
+            y1 = max(0, row - box_h // 2)
+            x2 = min(img.shape[1] - 1, x1 + box_w)
+            y2 = min(img.shape[0] - 1, y1 + box_h)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), -1)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 120, 255), 2)
+            text_x = x1 + (box_w - text_w) // 2
+            text_y = y1 + (box_h + text_h) // 2 - baseline
+            cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 0, 0), thickness, cv2.LINE_AA)
+
+        visible_count = 0
+        for idx, px in enumerate(np.asarray(pixels, dtype=np.float32)):
+            if idx >= len(valid) or not bool(valid[idx]):
+                continue
+            row = int(round(float(px[0])))
+            col = int(round(float(px[1])))
+            _draw_index_box(projected, row, col, idx)
+            visible_count += 1
+
+        invalid_count = int((~valid).sum())
+        if key_points_objects_map:
+            target_object = str(getattr(self.adapter, "target_object", ""))
+            target_idx = next(
+                (idx for idx, name in key_points_objects_map.items() if str(name) == target_object),
+                None,
+            )
+            if target_idx is not None and 0 <= target_idx < len(valid) and not bool(valid[target_idx]):
+                log.warning(
+                    "Refined target keypoint is outside camera view; "
+                    "keeping detector overlay to preserve keypoint-object correspondence."
+                )
+                return fallback_projected
+
+        if invalid_count > 0:
+            log.warning(
+                f"{invalid_count} refined keypoints are outside camera view; drawing visible refined keypoints only."
+            )
+        if visible_count == 0:
+            log.warning("No refined keypoints are visible in camera; keeping detector overlay.")
+            return fallback_projected
+
+        return projected
+
+    def _mujoco_guidance_has_hardcoded_world_target(self, txt_path: str) -> bool:
+        """Detect common failure mode where VLM emits fixed world-coordinate targets instead of keypoint-based goals."""
+        if self.backend != "mujoco" or not os.path.exists(txt_path):
+            return False
+
+        with open(txt_path, 'r') as f:
+            code = f.read()
+
+        # Match literal 3D coordinate tensors like torch.tensor([1.6, 0.5, 0.0]).
+        coord_re = re.compile(
+            r"torch\.tensor\(\s*\[\s*-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*,\s*"
+            r"-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*,\s*"
+            r"-?\d+(?:\.\d+)?(?:e[+-]?\d+)?\s*\]"
+        )
+
+        for line in code.splitlines():
+            stripped = line.strip()
+            if "dtype=torch.long" in stripped:
+                continue
+            if coord_re.search(stripped):
+                return True
+
+        return False
+
+    def _is_grasp_only_instruction(self, instruction: str) -> bool:
+        text = str(instruction).lower()
+        has_grasp = ("grasp" in text) or ("pick up" in text)
+        has_place = any(tok in text for tok in ("place", "drop", "put into", "put in", "into", "onto"))
+        return has_grasp and not has_place
+
+    def _mujoco_requires_placement(self) -> bool:
+        """
+        Determine whether the current MuJoCo task requires a placement stage.
+
+        For MuJoCo, relying only on instruction text is brittle (e.g. "grasp ...")
+        while success is still defined as object-to-zone placement.
+        """
+        if self.backend != "mujoco":
+            return False
+
+        task_info = {}
+        try:
+            task_info = self.adapter.get_task_info() if hasattr(self.adapter, "get_task_info") else {}
+        except Exception:
+            task_info = {}
+
+        # Explicit config from adapter/task definition takes precedence.
+        if "requires_placement" in task_info:
+            return bool(task_info["requires_placement"])
+
+        # Fallback: if a target zone is configured, treat as placement task.
+        target_zone = str(getattr(self.adapter, "target_zone", "") or "").strip()
+        return target_zone != ""
+
+    def _setup_builtin_mujoco_guidance(self, key_points_objects_map: dict[int, str]):
+        """Fallback stage guidance for MuJoCo when VLM generation is unavailable."""
+        target_object = getattr(self.adapter, "target_object", "Cylinder")
+        target_zone = getattr(self.adapter, "target_zone", "zone_drop")
+        grasp_only = self._is_grasp_only_instruction(self.adapter.get_instruction()) and not self._mujoco_requires_placement()
+
+        obj_idx = next((idx for idx, name in key_points_objects_map.items() if name == target_object), 0)
+        zone_idx = next((idx for idx, name in key_points_objects_map.items() if name == target_zone), obj_idx)
+
+        def _weights(action_sequence: torch.Tensor, final_boost: float = 3.0):
+            T = action_sequence.shape[1]
+            ts = torch.arange(T, device=action_sequence.device)
+            final_start = int(0.7 * T)
+            w = torch.where(
+                ts >= final_start,
+                torch.tensor(final_boost, dtype=action_sequence.dtype, device=action_sequence.device),
+                torch.tensor(1.0, dtype=action_sequence.dtype, device=action_sequence.device),
+            )
+            return w / w.sum()
+
+        def stage1_guidance(keypoints: torch.Tensor, action_sequence: torch.Tensor):
+            obj_pos = keypoints[obj_idx]
+            w = _weights(action_sequence, final_boost=3.0)
+            d = torch.norm(action_sequence - obj_pos.view(1, 1, 3), dim=-1)
+            reward = -((d ** 2) * w).sum(dim=1)
+            return reward.mean()
+
+        def stage2_guidance(keypoints: torch.Tensor, action_sequence: torch.Tensor):
+            zone_pos = keypoints[zone_idx]
+            obj_pos = keypoints[obj_idx]
+            w = _weights(action_sequence, final_boost=4.0)
+            d_zone = torch.norm(action_sequence - zone_pos.view(1, 1, 3), dim=-1)
+            d_obj = torch.norm(action_sequence - obj_pos.view(1, 1, 3), dim=-1)
+            reward = -((d_zone ** 2) * w).sum(dim=1) + 0.15 * (d_obj * w).sum(dim=1)
+            return reward.mean()
+
+        if grasp_only:
+            self.program_info = {
+                "num_stages": 1,
+                "stage_names": ["approach_and_grasp_object"],
+            }
+            self.guidance_fns = {
+                1: [stage1_guidance],
+            }
+            self.stage_descriptions = "Stage 1: approach and grasp target object"
+        else:
+            self.program_info = {
+                "num_stages": 2,
+                "stage_names": ["approach_object", "move_to_target_zone"],
+            }
+            self.guidance_fns = {
+                1: [stage1_guidance],
+                2: [stage2_guidance],
+            }
+            self.stage_descriptions = (
+                "Stage 1: approach and grasp target object\n"
+                "Stage 2: move grasped object to target zone"
+            )
+        log.warning("Using built-in MuJoCo steering guidance (VLM guidance unavailable)")
     
     def perform_task_for_episode(self, episode_dir: str):
         """Prepare for each episode (keypoint detection, guidance generation, etc.)"""
@@ -325,6 +777,33 @@ class Main:
             segmentation=segmentation,
             segment_id_to_name=segment_id_to_name
         )
+
+        if key_points is None or len(key_points) == 0:
+            if self.backend == "mujoco":
+                log.warning("No keypoints detected for MuJoCo task. Using fallback object/zone keypoints.")
+                key_points, mask_ids, segment_id_to_name = self._build_mujoco_fallback_keypoints()
+                projected_img = rgb.copy()
+            else:
+                raise RuntimeError("No keypoints detected and no fallback available for this backend")
+
+        # For MuJoCo placement tasks, append an explicit zone keypoint to prevent VLM from inventing world coords.
+        key_points, mask_ids, segment_id_to_name = self._augment_mujoco_keypoints_with_zone(
+            key_points,
+            mask_ids,
+            segment_id_to_name,
+        )
+
+        key_points_objects_map = self._build_keypoint_object_map(mask_ids, segment_id_to_name)
+        self._log_mujoco_keypoint_mapping_errors(key_points, key_points_objects_map, tag="before_refine")
+        key_points = self._refine_mujoco_target_keypoint(key_points, key_points_objects_map)
+        self._log_mujoco_keypoint_mapping_errors(key_points, key_points_objects_map, tag="after_refine")
+        projected_img = self._refresh_projected_keypoints_image(
+            rgb,
+            key_points,
+            mask_ids,
+            key_points_objects_map=key_points_objects_map,
+            fallback_projected=projected_img,
+        )
         
         # Register keypoints
         key_points_objects_map = self.keypoint_tracker.register_keypoints(
@@ -353,21 +832,55 @@ class Main:
                 'num_keypoints': len(key_points), 
                 'key_points_objects_map': key_points_objects_map
             }
-            guidance_functions_dir = self.vlm_agent.generate_guidance(
-                projected_img, instruction, metadata
-            )
+            try:
+                guidance_functions_dir = self.vlm_agent.generate_guidance(
+                    projected_img, instruction, metadata
+                )
+            except Exception as e:
+                if self.backend == "mujoco":
+                    log.warning(f"VLM guidance generation failed for MuJoCo ({e}), switching to built-in steering guidance.")
+                    self._setup_builtin_mujoco_guidance(key_points_objects_map)
+                    return
+                raise
         
-        # Load guidance functions
-        with open(os.path.join(guidance_functions_dir, 'metadata.json'), 'r') as f:
-            self.program_info = json.load(f)
-        
-        self.guidance_fns = dict()
-        for stage in range(1, self.program_info['num_stages'] + 1):
-            load_path = os.path.join(guidance_functions_dir, f'stage{stage}_guidance.txt')
-            self.guidance_fns[stage] = load_functions_from_txt(load_path) if os.path.exists(load_path) else []
-        
-        output_raw_path = os.path.join(guidance_functions_dir, 'output_raw.txt')
-        self.stage_descriptions = self.vlm_agent._extract_stage_descriptions_from_output(output_raw_path)
+        try:
+            # Load guidance functions
+            with open(os.path.join(guidance_functions_dir, 'metadata.json'), 'r') as f:
+                self.program_info = json.load(f)
+
+            self.guidance_fns = dict()
+            has_hardcoded_world_target = False
+            for stage in range(1, self.program_info['num_stages'] + 1):
+                load_path = os.path.join(guidance_functions_dir, f'stage{stage}_guidance.txt')
+                self.guidance_fns[stage] = load_functions_from_txt(load_path) if os.path.exists(load_path) else []
+                if self._mujoco_guidance_has_hardcoded_world_target(load_path):
+                    has_hardcoded_world_target = True
+
+            if self.backend == "mujoco" and has_hardcoded_world_target:
+                log.warning("Detected hardcoded world-coordinate target in MuJoCo VLM guidance; switching to built-in keypoint-based guidance.")
+                self._setup_builtin_mujoco_guidance(key_points_objects_map)
+                return
+
+            output_raw_path = os.path.join(guidance_functions_dir, 'output_raw.txt')
+            self.stage_descriptions = self.vlm_agent._extract_stage_descriptions_from_output(output_raw_path)
+
+            if self.backend == "mujoco" and self._is_grasp_only_instruction(instruction) and not self._mujoco_requires_placement():
+                if self.program_info.get('num_stages', 1) > 1:
+                    log.info("MuJoCo instruction is grasp-only; enforcing single-stage guidance.")
+                stage_names = self.program_info.get('stage_names') or []
+                first_stage_name = stage_names[0] if len(stage_names) > 0 else "approach_and_grasp_object"
+                self.program_info['num_stages'] = 1
+                self.program_info['stage_names'] = [first_stage_name]
+                self.guidance_fns = {1: self.guidance_fns.get(1, [])}
+                if isinstance(self.stage_descriptions, str):
+                    lines = [ln.strip() for ln in self.stage_descriptions.splitlines() if ln.strip()]
+                    self.stage_descriptions = lines[0] if len(lines) > 0 else "Stage 1: approach and grasp target object"
+        except Exception as e:
+            if self.backend == "mujoco":
+                log.warning(f"Failed to load VLM guidance files for MuJoCo ({e}), switching to built-in steering guidance.")
+                self._setup_builtin_mujoco_guidance(key_points_objects_map)
+                return
+            raise
         
         for stage, fns in self.guidance_fns.items():
             log.info(f"Stage {stage}: {len(fns)} guidance functions loaded")
@@ -418,6 +931,23 @@ class Main:
         # Query VLM if triggered (with limit check)
         vlm_query_limit = self.config.get("vlm_query_limit", 10)
         vlm_query_count = state.get('vlm_query_count', 0)
+
+        if self.gemini_stage_recognizer is not None and getattr(self.gemini_stage_recognizer, 'is_disabled', False):
+            log.warning("Gemini stage recognizer disabled; switching to local stage fallback.")
+            self.gemini_stage_recognizer = None
+
+        # Local fallback stage transition when external stage recognizer is disabled.
+        if self.gemini_stage_recognizer is None and state.get('use_guidance', False):
+            max_stage = len(getattr(self, 'guidance_fns', {}))
+            if max_stage > 1:
+                should_advance = (state['current_stage'] == 1) and (gripper_just_closed or reward_rising)
+                if should_advance:
+                    next_stage = min(state['current_stage'] + 1, max_stage)
+                    if next_stage != state['current_stage']:
+                        log.info(f"[LocalStage] Stage: {state['current_stage']} -> {next_stage} (trigger: {trigger_reason or 'reward/gripper'})")
+                        self.policy.reset_stage()
+                        curr_reward = 0.0
+                        state['current_stage'] = next_stage
         
         if trigger_reason and self.gemini_stage_recognizer is not None and vlm_query_count < vlm_query_limit:
             log.info(f"[Trigger] {trigger_reason} (query {vlm_query_count + 1}/{vlm_query_limit})")
@@ -457,6 +987,9 @@ class Main:
         self.success_count = 0
         base_output_dir = self.output_dir
         episode_num = self.config.get('episode_num', 10)
+
+        if not self.config.get("use_guidance", True):
+            log.warning("Guidance is disabled (main.use_guidance=false). Running policy-only rollout.")
         
         for episode in range(episode_num):
             episode_seed = torch.randint(0, 1000, (1,)).item()
@@ -473,7 +1006,8 @@ class Main:
             recommended_scale = task_info.get('recommended_guide_scale')
             if recommended_scale is not None:
                 self.current_guide_scale = recommended_scale
-            log.info(f"Task {task_info.get('task_id', '?')}: guide_scale={self.current_guide_scale}")
+            task_label = task_info.get('task_id') or task_info.get('task_name') or task_info.get('instruction') or '?'
+            log.info(f"Task {task_label}: guide_scale={self.current_guide_scale}")
             
             # Perform task preparation with error handling
             episode_error = False
@@ -526,8 +1060,51 @@ class Main:
             f.write(f"Success count: {self.success_count}/{episode_num}\n")
             f.write(f"Success rate: {success_rate:.2f}%\n")
 
+
+    def _save_episode_compat_video(self, video_base_path: str):
+        """Save compatibility video without camera suffix: episode_{n}_{success|fail}.mp4."""
+        cam_name = getattr(self.adapter, "vlm_camera", None)
+        if not cam_name:
+            return
+
+        src = f"{video_base_path}_{cam_name}.mp4"
+        dst = f"{video_base_path}.mp4"
+        if not os.path.exists(src):
+            return
+        shutil.copyfile(src, dst)
+        log.info(f"Saved compatibility episode video to {dst}")
+
+    def _save_keypoints_tracking_video(self, episode_dir: str, frames: list[np.ndarray]):
+        """Save keypoint tracking video for the episode."""
+        if len(frames) == 0:
+            return
+
+        max_h = max(frame.shape[0] for frame in frames)
+        max_w = max(frame.shape[1] for frame in frames)
+        target_shape = (max_h, max_w, 3)
+
+        normalized_frames: list[np.ndarray] = []
+        for frame in frames:
+            if frame.shape != target_shape:
+                padded = np.zeros(target_shape, dtype=np.uint8)
+                padded[:frame.shape[0], :frame.shape[1], :] = frame
+                frame = padded
+            normalized_frames.append(frame)
+
+        video_path = os.path.join(episode_dir, "keypoints_tracking.mp4")
+        imageio.mimsave(
+            video_path,
+            normalized_frames,
+            fps=self.video_recorder.fps,
+            codec='libx264',
+            quality=8
+        )
+        log.info(f"Saved keypoint tracking video to {video_path} ({len(normalized_frames)} frames)")
+
     def _run_episode(self, episode: int, episode_dir: str):
         """Run a single episode with the current configuration."""
+        from utils.vis_utils import draw_keypoints_on_image
+
         observation = self._get_policy_observation()
         
         # Evaluation loop
@@ -541,6 +1118,8 @@ class Main:
         action_horizon = self.policy._action_chunk_horizon
         current_stage = 1
         current_guidance_fns = None
+        trajectory_frame_idx = 0
+        keypoint_tracking_frames: list[np.ndarray] = []
         
         # Stage recognition thresholds
         UPPER_THRESHOLD = self.config.get("schmitt_upper", 0.8)
@@ -575,6 +1154,10 @@ class Main:
 
             if generate_new_chunk and self.config.get("use_guidance", True) and hasattr(self, 'guidance_fns'):
                 keypoints = self.keypoint_tracker.get_keypoint_positions()
+                keypoints = self._refine_live_mujoco_guidance_keypoints(
+                    keypoints,
+                    getattr(self, "keypoint_id_to_object", {}),
+                )
                 mask_ids = self.keypoint_tracker.get_mask_ids()
                 
                 # Update stage recognition
@@ -619,11 +1202,6 @@ class Main:
                 current_stage=current_stage,
             )
 
-            if hasattr(self.adapter, 'env_postprocessor'):
-                action_transition = {"action": action_chunk}
-                action_transition = self.adapter.env_postprocessor(action_transition)
-                action_chunk = action_transition["action"]
-
             # Get image and add status overlay
             if self.config.get("debug_draw_trajectory", False):
                 from utils.vis_utils import draw_action_trajectory_on_vlm_image
@@ -639,13 +1217,33 @@ class Main:
             
             # Draw keypoints on image for debugging (disabled by default)
             if self.config.get("debug_draw_keypoints", False) and keypoints is not None:
-                from utils.vis_utils import draw_keypoints_on_image
                 image = draw_keypoints_on_image(
                     adapter=self.adapter,
                     image=image,
                     keypoints=keypoints,
                     mask_ids=mask_ids
                 )
+
+            # Build dedicated keypoint-tracking frame (separate from trajectory/status debug video).
+            keypoint_frame = np.array(self.adapter.get_vlm_image())
+            tracker_mask_ids = self.keypoint_tracker.get_mask_ids()
+            if tracker_mask_ids.size > 0:
+                tracker_keypoints = self.keypoint_tracker.get_keypoint_positions()
+                tracker_keypoints = self._refine_live_mujoco_guidance_keypoints(
+                    tracker_keypoints,
+                    getattr(self, "keypoint_id_to_object", {}),
+                )
+                keypoint_frame = draw_keypoints_on_image(
+                    adapter=self.adapter,
+                    image=keypoint_frame,
+                    keypoints=tracker_keypoints,
+                    mask_ids=tracker_mask_ids,
+                )
+            keypoint_frame = add_text_to_image(
+                keypoint_frame,
+                [f"Step:{global_steps} Stage:{current_stage}", "Keypoints:TRACK"],
+            )
+            keypoint_tracking_frames.append(keypoint_frame)
             
             # Add guidance status overlay
             gripper_val = self._get_gripper_value(action_chunk, action_executed)
@@ -694,34 +1292,11 @@ class Main:
                 behavior_name = info.get("behavior_name", "unknown")
                 video_path = os.path.join(episode_dir, f'episode_{episode+1}_{"success" if is_success else "fail"}')
                 self.video_recorder.save_video(save_path=video_path, success=is_success, behavior_name=behavior_name)
+                self._save_episode_compat_video(video_path)
+                self._save_keypoints_tracking_video(episode_dir, keypoint_tracking_frames)
                 break
         
         log.info(f"Episode {episode+1} finished, success: {info.get('success', False)}, steps: {global_steps}")
-    
-    def _plot_behavior_stats(self):
-        """Draw behavior statistics plot."""
-        behavior_data = self.adapter.get_behavior_static()
-        labels = list(behavior_data.keys())
-        values = list(behavior_data.values())
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        bars = ax.bar(labels, values, color='steelblue', edgecolor='black')
-        
-        for bar, val in zip(bars, values):
-            height = bar.get_height()
-            ax.annotate(f'{val}',
-                       xy=(bar.get_x() + bar.get_width() / 2, height),
-                       xytext=(0, 3),
-                       textcoords="offset points",
-                       ha='center', va='bottom',
-                       fontsize=10, fontweight='bold')
-        
-        ax.set_ylabel('Count', fontsize=12)
-        ax.set_title('Behavior Statistics', fontsize=14)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'behavior_static.png'), dpi=150)
-        plt.close()
     
     def run_test(self):
         """Test segmentation and keypoint detection."""
@@ -774,6 +1349,54 @@ class Main:
             log.info(f"  [{i}] {obj_name}: position=[{kp[0]:.4f}, {kp[1]:.4f}, {kp[2]:.4f}]")
 
 
+def _normalize_hydra_cli_args(argv: List[str]) -> List[str]:
+    """Normalize legacy CLI flags to Hydra-compatible flags.
+
+    Supports:
+        --config config.yaml
+        --config=config.yaml
+        --config path/to/config.yaml
+    """
+    normalized = [argv[0]]
+    idx = 1
+
+    while idx < len(argv):
+        arg = argv[idx]
+
+        if arg == "--config":
+            if idx + 1 >= len(argv):
+                raise ValueError("--config requires a value, e.g. --config config.yaml")
+            config_value = argv[idx + 1]
+            idx += 2
+        elif arg.startswith("--config="):
+            config_value = arg.split("=", 1)[1]
+            idx += 1
+        else:
+            normalized.append(arg)
+            idx += 1
+            continue
+
+        if not config_value:
+            raise ValueError("--config value cannot be empty")
+
+        config_path, config_file = os.path.split(config_value)
+        config_name, ext = os.path.splitext(config_file)
+
+        if ext in {".yaml", ".yml"}:
+            target_name = config_name
+        else:
+            target_name = config_file
+
+        if not target_name:
+            raise ValueError(f"Invalid --config value: {config_value}")
+
+        if config_path:
+            normalized.extend(["--config-path", config_path])
+        normalized.extend(["--config-name", target_name])
+
+    return normalized
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     """
@@ -814,4 +1437,9 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
+    try:
+        sys.argv = _normalize_hydra_cli_args(sys.argv)
+    except ValueError as exc:
+        print(f"CLI argument error: {exc}", file=sys.stderr)
+        sys.exit(2)
     main()
