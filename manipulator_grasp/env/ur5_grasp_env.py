@@ -1,6 +1,11 @@
 import os
 from typing import Any, Optional
 
+# Default to EGL for headless Linux rendering to avoid corrupted offscreen frames.
+if os.name != "nt" and "MUJOCO_GL" not in os.environ:
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["MUJOCO_GL"] = "egl"
+
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -26,7 +31,12 @@ class UR5GraspEnv:
         self.fovy = float(cfg.get("camera_fovy", np.pi / 4.0))
 
         self.camera_name = cfg.get("camera_name", "cam")
-        self.render_viewer = bool(cfg.get("render", False))
+        requested_render = bool(cfg.get("render", False))
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        # Interactive viewer is unstable in headless sessions; keep offscreen render path available.
+        self.render_viewer = requested_render and has_display
+        if requested_render and not has_display:
+            print("[UR5GraspEnv] render=true requested but no display detected; disabling interactive viewer and using offscreen rendering only.")
         self.max_episode_steps = int(cfg.get("max_episode_steps", 300))
 
         self.task_name = cfg.get("task_name", "pick_and_place_cylinder")
@@ -116,6 +126,29 @@ class UR5GraspEnv:
             return True, f"{self.target_object.lower()}_to_{self.target_zone.lower()}"
         return False, "no_behavior"
 
+    def _make_renderer(
+        self,
+        width: int,
+        height: int,
+        *,
+        depth: bool = False,
+        segmentation: bool = False,
+    ) -> mujoco.Renderer:
+        self._ensure_initialized()
+        renderer = mujoco.Renderer(self.mj_model, height=height, width=width)
+        if depth:
+            renderer.enable_depth_rendering()
+        if segmentation:
+            renderer.enable_segmentation_rendering()
+        return renderer
+
+    def _close_renderers(self):
+        for attr_name in ("mj_renderer", "mj_depth_renderer", "mj_seg_renderer"):
+            renderer = getattr(self, attr_name)
+            if renderer is not None:
+                renderer.close()
+                setattr(self, attr_name, None)
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
             np.random.seed(seed)
@@ -123,6 +156,8 @@ class UR5GraspEnv:
         if self.mj_viewer is not None:
             self.mj_viewer.close()
             self.mj_viewer = None
+
+        self._close_renderers()
 
         self.mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
         self.mj_data = mujoco.MjData(self.mj_model)
@@ -132,7 +167,8 @@ class UR5GraspEnv:
         self.robot.set_base(mj.get_body_pose(self.mj_model, self.mj_data, "ur5e_base").t)
         self.robot.set_tool(sm.SE3.Trans(0.0, 0.0, 0.13) * sm.SE3.RPY(-np.pi / 2, -np.pi / 2, 0.0))
 
-        q0 = np.array([0.0, -0.6, 1.2, -1.2, -1.57, 0.0], dtype=np.float32)
+        # Use a bent-elbow home pose to stay away from wrist/shoulder singularity at episode start.
+        q0 = np.array([-0.6, -1.0, 1.6, -1.5, -1.3, 0.0], dtype=np.float32)
         self._set_joint_positions(q0)
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
@@ -141,12 +177,17 @@ class UR5GraspEnv:
         self.mj_data.ctrl[6] = 0.0
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
-        self.mj_renderer = mujoco.Renderer(self.mj_model, height=self.visualization_height, width=self.visualization_width)
-        self.mj_depth_renderer = mujoco.Renderer(self.mj_model, height=self.visualization_height, width=self.visualization_width)
-        self.mj_depth_renderer.enable_depth_rendering()
-
-        self.mj_seg_renderer = mujoco.Renderer(self.mj_model, height=self.visualization_height, width=self.visualization_width)
-        self.mj_seg_renderer.enable_segmentation_rendering()
+        self.mj_renderer = self._make_renderer(width=self.visualization_width, height=self.visualization_height)
+        self.mj_depth_renderer = self._make_renderer(
+            width=self.visualization_width,
+            height=self.visualization_height,
+            depth=True,
+        )
+        self.mj_seg_renderer = self._make_renderer(
+            width=self.visualization_width,
+            height=self.visualization_height,
+            segmentation=True,
+        )
 
         if self.render_viewer:
             self.mj_viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
@@ -164,15 +205,7 @@ class UR5GraspEnv:
         if self.mj_viewer is not None:
             self.mj_viewer.close()
             self.mj_viewer = None
-        if self.mj_renderer is not None:
-            self.mj_renderer.close()
-            self.mj_renderer = None
-        if self.mj_depth_renderer is not None:
-            self.mj_depth_renderer.close()
-            self.mj_depth_renderer = None
-        if self.mj_seg_renderer is not None:
-            self.mj_seg_renderer.close()
-            self.mj_seg_renderer = None
+        self._close_renderers()
 
     def step(self, action: Optional[np.ndarray] = None):
         self._ensure_initialized()
@@ -225,13 +258,12 @@ class UR5GraspEnv:
         if self.mj_renderer is None or self.mj_renderer.width != w or self.mj_renderer.height != h:
             if self.mj_renderer is not None:
                 self.mj_renderer.close()
-            self.mj_renderer = mujoco.Renderer(self.mj_model, height=h, width=w)
+            self.mj_renderer = self._make_renderer(width=w, height=h)
 
         if self.mj_depth_renderer is None or self.mj_depth_renderer.width != w or self.mj_depth_renderer.height != h:
             if self.mj_depth_renderer is not None:
                 self.mj_depth_renderer.close()
-            self.mj_depth_renderer = mujoco.Renderer(self.mj_model, height=h, width=w)
-            self.mj_depth_renderer.enable_depth_rendering()
+            self.mj_depth_renderer = self._make_renderer(width=w, height=h, depth=True)
 
         self.mj_renderer.update_scene(self.mj_data, camera=cam)
         self.mj_depth_renderer.update_scene(self.mj_data, camera=cam)
@@ -245,8 +277,7 @@ class UR5GraspEnv:
             if self.mj_seg_renderer is None or self.mj_seg_renderer.width != w or self.mj_seg_renderer.height != h:
                 if self.mj_seg_renderer is not None:
                     self.mj_seg_renderer.close()
-                self.mj_seg_renderer = mujoco.Renderer(self.mj_model, height=h, width=w)
-                self.mj_seg_renderer.enable_segmentation_rendering()
+                self.mj_seg_renderer = self._make_renderer(width=w, height=h, segmentation=True)
 
             self.mj_seg_renderer.update_scene(self.mj_data, camera=cam)
             out["segmentation"] = self.mj_seg_renderer.render().copy()
